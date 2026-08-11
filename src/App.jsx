@@ -142,39 +142,25 @@ const CAT_ICONS = {
 };
 const DEFAULT_CATS = Object.keys(CAT_ICONS);
 
-const INIT_ACCS = [
-  {id:"cash",    name:"Cash in Hand",    balance:300,      color:"#9A7B1F", icon:"💵", type:"cash"},
-  {id:"askari",  name:"Askari Bank",     balance:64289.51, color:"#2C5F8A", icon:"🏦", type:"bank",       tag:"current"},
-  {id:"meezan",  name:"Meezan Bank",     balance:48351,    color:"#1B6B54", icon:"🏦", type:"bank",       tag:"current"},
-  {id:"bislami", name:"Bank Islami",     balance:14992,    color:"#5B7C6E", icon:"🏦", type:"bank",       tag:"salary+current"},
-  {id:"ep",      name:"Easypaisa",       balance:7.09,     color:"#B08D3E", icon:"📱", type:"wallet"},
-  {id:"eploan",  name:"Easypaisa Loan",  balance:0,        color:"#1B6B54", icon:"✓",  type:"loan",       tag:"closed"},
-  {id:"mahaana", name:"Mahaana MICF",    balance:28707,    color:"#2A8A6E", icon:"📈", type:"investment", tag:"savings", rate:10.36},
-  {id:"mobiloan",name:"Mobile Loan",     balance:-20000,   color:"#A33B2C", icon:"⚠",  type:"loan"},
-  {id:"mashreq", name:"Mashreq Bank",    balance:0.01,     color:"#4A7BA0", icon:"🏦", type:"bank",       tag:"savings", rate:10},
-];
-
-const INIT_TXS = [
-  {id:1001,date:"2026-08-11",desc:"Salary — PRIME BPO (Aug 2026)",amount:127451,type:"income",  category:"Income",       from:null,      to:"bislami"},
-  {id:1002,date:"2026-08-11",desc:"Easypaisa Loan repayment",     amount:8337,  type:"expense", category:"Loan Payment", from:"askari",  to:null},
-  {id:1003,date:"2026-08-11",desc:"Deposit to Mahaana MICF",      amount:7000,  type:"transfer",category:"Investment",   from:"askari",  to:"mahaana"},
-  {id:1004,date:"2026-08-11",desc:"Mobile phone loan instalment", amount:10000, type:"expense", category:"Loan Payment", from:"bislami", to:null},
-  {id:1005,date:"2026-08-11",desc:"Travel",                       amount:100,   type:"expense", category:"Transport & Travel",     from:"cash",   to:null},
-  {id:1006,date:"2026-08-11",desc:"Sent to family",                amount:3000,  type:"expense", category:"Family Support / Rishtedar", from:"askari", to:null},
-];
-const INIT_IDS = new Set(INIT_TXS.map(t=>t.id));
+// Every new user starts with an empty ledger — no seeded accounts or
+// transactions. Users add their own accounts via the "Add account" sheet.
+const INIT_ACCS = [];
+const INIT_TXS = [];
 const CORE_IDS = new Set(INIT_ACCS.map(a=>a.id));
 
-function recalc(allTxs){
-  const b={};INIT_ACCS.forEach(a=>{b[a.id]=a.balance;});
-  allTxs.filter(t=>!INIT_IDS.has(t.id)&&!t.isAdj).forEach(t=>{
+// Balances are computed by folding every transaction onto each account's
+// own opening balance (set at creation time), so this works for any set
+// of accounts a user creates — not just a fixed baked-in list.
+function recalc(accounts, allTxs){
+  const b={};accounts.forEach(a=>{b[a.id]=a.opening ?? a.balance ?? 0;});
+  allTxs.forEach(t=>{
     if(t.type==="transfer"){if(t.from&&b[t.from]!==undefined)b[t.from]-=t.amount;if(t.to&&b[t.to]!==undefined)b[t.to]+=t.amount;}
     else if(t.type==="expense"){if(t.from&&b[t.from]!==undefined)b[t.from]-=t.amount;}
     else if(t.type==="income"){if(t.to&&b[t.to]!==undefined)b[t.to]+=t.amount;}
   });
   return b;
 }
-function applyBalMap(accounts,txs){const m=recalc(txs);return accounts.map(a=>m[a.id]!==undefined?{...a,balance:m[a.id]}:a);}
+function applyBalMap(accounts,txs){const m=recalc(accounts,txs);return accounts.map(a=>m[a.id]!==undefined?{...a,balance:m[a.id]}:a);}
 
 function reducer(state,action){
   switch(action.type){
@@ -189,7 +175,7 @@ function reducer(state,action){
       const adj={id:Date.now(),date:new Date().toISOString().slice(0,10),desc:`Balance correction — ${acc.name}`,amount:Math.abs(diff),type:diff>0?"income":"expense",category:"Miscellaneous",from:diff<0?action.id:null,to:diff>0?action.id:null,isAdj:true};
       const txs=[adj,...state.txs];return{...state,txs,accounts:applyBalMap(state.accounts,txs)};
     }
-    case "LOAD_TXS":{const m=recalc(action.txs);return{...state,txs:action.txs,accounts:state.accounts.map(a=>m[a.id]!==undefined?{...a,balance:m[a.id]}:a)};}
+    case "LOAD_TXS":{const m=recalc(state.accounts,action.txs);return{...state,txs:action.txs,accounts:state.accounts.map(a=>m[a.id]!==undefined?{...a,balance:m[a.id]}:a)};}
     case "LOAD_ACCS":return{...state,accounts:action.accs};
     default:return state;
   }
@@ -735,20 +721,23 @@ function Analytics({txs,accounts}){
       .map(([c,a])=>`${c}: Rs ${Math.round(a).toLocaleString()}`).join("; ");
 
     const txCount = txs.filter(t=>!t.isAdj).length;
-    const mahaanaBal = accounts.find(a=>a.id==="mahaana")?.balance || 0;
-    const bufferPct = ((mahaanaBal/465000)*100).toFixed(1);
+    const bufferAccounts = accounts.filter(a=>a.tag==="savings"||a.type==="investment");
+    const bufferBal = bufferAccounts.reduce((s,a)=>s+a.balance,0);
+    const monthsOfData = Object.keys(moMap).length || 1;
+    const avgMonthlyExp = (Object.values(moMap).reduce((s,v)=>s+v.expense,0))/monthsOfData;
+    const sixMonthTarget = Math.round(avgMonthlyExp*6);
+    const threeMonthTarget = Math.round(avgMonthlyExp*3);
+    const bufferPct = sixMonthTarget>0 ? ((bufferBal/sixMonthTarget)*100).toFixed(1) : "n/a";
+    const loanAccounts = accounts.filter(a=>a.type==="loan"&&a.balance<0);
+    const loanSum = loanAccounts.map(a=>`${a.name}: Rs ${Math.round(Math.abs(a.balance)).toLocaleString()}`).join("; ") || "none";
 
     const PROMPT =
-`You are a rigorous personal finance advisor specialising in Pakistan. You give specific, numbers-driven advice grounded in actual transaction data. You never invent figures. Reply with raw JSON only — no markdown, no code fences, no preamble, no text outside the JSON object.
+`You are a rigorous personal finance advisor specialising in Pakistan. You give specific, numbers-driven advice grounded strictly in the actual transaction data provided below — never invent a persona, a goal, or a figure that isn't derivable from it. Reply with raw JSON only — no markdown, no code fences, no preamble, no text outside the JSON object.
 
-Analyse the complete financial history below and produce actionable savings advice.
-
-## PROFILE
-Jamil Ahmed — salaried IT professional (Assistant IT Manager), Pakistan.
-Goal: build emergency buffer, then car fund, then equity investing. Retirement target age 55-60.
+Analyse the complete financial history below and produce actionable savings advice for this user.
 
 ## CURRENT POSITION
-Accounts: ${accSum}
+Accounts: ${accSum || "(none yet)"}
 Total assets: Rs ${Math.round(totalAssets).toLocaleString()}
 Total liabilities: Rs ${Math.round(totalLiab).toLocaleString()}
 Net worth: Rs ${Math.round(totalAssets-totalLiab).toLocaleString()}
@@ -771,27 +760,26 @@ ${catTrend || "(no data)"}
 ## CURRENT PERIOD BREAKDOWN
 ${expSum || "(no expenses logged this period)"}
 
-## MARKET CONTEXT (Pakistan, Aug 2026)
-SBP policy rate 11.5% | CPI inflation ~9.2% | Mahaana Islamic Cash Fund yield 10.36% p.a. | Mashreq Islamic savings 10% p.a.
+## MARKET CONTEXT (Pakistan)
+SBP policy rate and CPI inflation move over time — use your general knowledge of current Pakistani rates rather than a fixed figure, and say so if you're estimating.
 
-## GOALS & CONSTRAINTS
-- Emergency buffer target: Rs 465,000 (6 months). Currently Rs ${Math.round(mahaanaBal).toLocaleString()} in Mahaana MICF = ${bufferPct}% of target.
-- 3-month milestone: Rs 237,500.
-- Outstanding mobile phone loan: Rs 20,000.
-- Recurring fixed costs: school fee, hostel rent, hostel electricity, PTCL, IESCO, SNGPL, M-TAG, mobile packages, subscriptions (YouTube Premium, Claude, Netflix).
-- Sends variable cash support to mother and sisters; also sends/receives online transfers with relatives.
+## EMERGENCY BUFFER (derived from this user's own data, not a fixed target)
+- Savings/investment-tagged accounts: Rs ${Math.round(bufferBal).toLocaleString()} (${bufferAccounts.map(a=>a.name).join(", ") || "none yet"}).
+- Six-month target (6× average monthly expense of Rs ${Math.round(avgMonthlyExp).toLocaleString()}): Rs ${sixMonthTarget.toLocaleString()} — currently ${bufferPct}% funded.
+- Three-month milestone: Rs ${threeMonthTarget.toLocaleString()}.
+- Outstanding loans: ${loanSum}.
 - Total transactions logged so far: ${txCount}.
 
 ## INSTRUCTIONS
-1. If transaction data is sparse (fewer than 10 entries), say so plainly in the verdict and give advice based on the balance sheet and known fixed costs rather than inventing spending patterns.
-2. Quote real Rs figures from the data above. Never fabricate a number that is not derivable from it.
+1. If transaction data is sparse (fewer than 10 entries), say so plainly in the verdict and give advice based on the balance sheet alone rather than inventing spending patterns.
+2. Quote real Rs figures from the data above. Never fabricate a number that is not derivable from it. If a figure isn't available (e.g. no loans, no savings accounts), say so instead of guessing.
 3. Be specific to Pakistan: mention actual providers, tax rules, or local alternatives where relevant.
 4. Challenge the user where the data warrants it — do not just validate.
-5. Calculate the buffer timeline honestly from the actual monthly savings figure.
+5. Calculate the buffer timeline honestly from the actual monthly savings figure and the six-month target above.
 
 ## OUTPUT
 Reply with this exact JSON shape and nothing else:
-{"verdict":"2 sentences assessing savings rate, citing real numbers","patterns":"2 sentences on trends or anomalies found in the daily/monthly data","suggestions":[{"title":"short specific title","detail":"2-3 sentences, Pakistan-specific, cites real Rs amounts","saving":"Rs X/mo"},{"title":"...","detail":"...","saving":"Rs X/mo"},{"title":"...","detail":"...","saving":"Rs X/mo"}],"buffer_months":"honest estimate of months to reach Rs 237,500 at the current savings pace","quick_win":"one concrete action for this week with a Rs figure","debt":"strategy for the Rs 20,000 mobile loan","emergency":"advice on emergency fund pace"}`;
+{"verdict":"2 sentences assessing savings rate, citing real numbers","patterns":"2 sentences on trends or anomalies found in the daily/monthly data","suggestions":[{"title":"short specific title","detail":"2-3 sentences, Pakistan-specific, cites real Rs amounts","saving":"Rs X/mo"},{"title":"...","detail":"...","saving":"Rs X/mo"},{"title":"...","detail":"...","saving":"Rs X/mo"}],"buffer_months":"honest estimate of months to reach the six-month target above at the current savings pace, or note if there isn't enough data","quick_win":"one concrete action for this week with a Rs figure","debt":"strategy for any outstanding loans listed above, or note there are none","emergency":"advice on emergency fund pace given the buffer figures above"}`;
 
     // ── Guard: keep the prompt within a safe size ──
     const SAFE_LIMIT = 24000;
@@ -1071,7 +1059,7 @@ Reply with this exact JSON shape and nothing else:
 
 /* ── Your Advisor: a persistent, steerable chat over your own ledger data ── */
 const DEFAULT_PERSONA =
-`You are Jamil's personal finance advisor, built on top of his own transaction ledger. You are direct, numbers-first, and never flatter him. You challenge weak reasoning. You cite real Rs figures from the data provided — never invented ones. You know he is a salaried IT professional in Pakistan (Assistant IT Manager), building an emergency buffer in Mahaana MICF toward a 6-month target of Rs 465,000, currently paying off a Rs 20,000 mobile loan, sending money to family, and eventually planning to move into PSX equity funds once the buffer is complete. Keep answers focused and concrete — prefer a short, sharp answer with real numbers over a long generic one.`;
+`You are the user's personal finance advisor, built on top of their own transaction ledger. You are direct, numbers-first, and never flatter them. You challenge weak reasoning. You cite real Rs figures from the data provided in the ledger context below — never invented ones. Base everything you know about the user's goals, accounts, and debts strictly on that data; don't assume a profession, a specific fund, or a fixed target that isn't shown there. Keep answers focused and concrete — prefer a short, sharp answer with real numbers over a long generic one.`;
 
 function buildLedgerContext(txs, accounts){
   const totalAssets = accounts.filter(a=>a.balance>0).reduce((s,a)=>s+a.balance,0);
@@ -1103,8 +1091,12 @@ function buildLedgerContext(txs, accounts){
   txs.filter(t=>t.type==="expense"&&!t.isAdj).forEach(t=>{ allCats[t.category]=(allCats[t.category]||0)+t.amount; });
   const catTotals = Object.entries(allCats).sort((a,b)=>b[1]-a[1]).map(([c,a])=>`${c}: Rs${Math.round(a).toLocaleString()}`).join("; ");
 
-  const mahaana = accounts.find(a=>a.id==="mahaana");
-  const bufferPct = mahaana ? ((mahaana.balance/465000)*100).toFixed(1) : "n/a";
+  const bufferAccounts = accounts.filter(a=>a.tag==="savings"||a.type==="investment");
+  const bufferBal = bufferAccounts.reduce((s,a)=>s+a.balance,0);
+  const monthsOfData = Object.keys(moMap).length || 1;
+  const avgMonthlyExp = (Object.values(moMap).reduce((s,v)=>s+v.expense,0))/monthsOfData;
+  const sixMonthTarget = Math.round(avgMonthlyExp*6);
+  const bufferPct = sixMonthTarget>0 ? ((bufferBal/sixMonthTarget)*100).toFixed(1) : "n/a";
 
   return `## ACCOUNTS
 ${accSum}
@@ -1114,7 +1106,7 @@ Total assets: Rs ${Math.round(totalAssets).toLocaleString()} | Total liabilities
 Income Rs ${Math.round(mInc).toLocaleString()} | Expenses Rs ${Math.round(mExp).toLocaleString()} | Saved Rs ${Math.round(mInc-mExp).toLocaleString()}
 
 ## EMERGENCY BUFFER
-Mahaana MICF: Rs ${mahaana?Math.round(mahaana.balance).toLocaleString():"0"} — ${bufferPct}% of the Rs 465,000 six-month target
+Savings/investment accounts: Rs ${Math.round(bufferBal).toLocaleString()} (${bufferAccounts.map(a=>a.name).join(", ") || "none yet"}) — ${bufferPct}% of the Rs ${sixMonthTarget.toLocaleString()} six-month target (6× average monthly expense)
 
 ## MONTH-BY-MONTH (most recent first)
 ${moSum || "(no monthly data yet)"}
@@ -1328,7 +1320,7 @@ function Workspace({userId, userEmail, onLogout}){
   const [balId,setBalId]=useState(null);
   const [balDraft,setBalDraft]=useState("");
   const [sheet,setSheet]=useState(null);
-  const [form,setForm]=useState({date:today(),desc:"",amount:"",type:"expense",category:"Food & Dining",from:"bislami",to:"mahaana"});
+  const [form,setForm]=useState({date:today(),desc:"",amount:"",type:"expense",category:"Food & Dining",from:null,to:null});
   const [txErr,setTxErr]=useState("");
   const [accForm,setAccForm]=useState({name:"",balance:"",type:"bank",color:ACCT_COLORS[0]});
   const [accErr,setAccErr]=useState("");
@@ -1363,8 +1355,18 @@ function Workspace({userId, userEmail, onLogout}){
   const mInc=useMemo(()=>state.txs.filter(t=>t.type==="income"&&!t.isAdj&&t.date.startsWith(mo)).reduce((s,t)=>s+t.amount,0),[state.txs]);
   const mExp=useMemo(()=>state.txs.filter(t=>t.type==="expense"&&!t.isAdj&&t.date.startsWith(mo)).reduce((s,t)=>s+t.amount,0),[state.txs]);
   const mSav=mInc-mExp;
-  const mahaana=state.accounts.find(a=>a.id==="mahaana");
-  const T3=237500,T6=465000;
+  // Emergency buffer = any account tagged "savings" or typed "investment".
+  // Target is a rolling average of the user's own monthly expenses — not a
+  // fixed figure — so it's meaningful for any user's actual spending.
+  const bufferAccounts=state.accounts.filter(a=>a.tag==="savings"||a.type==="investment");
+  const bufferBal=bufferAccounts.reduce((s,a)=>s+a.balance,0);
+  const avgMonthlyExp=useMemo(()=>{
+    const byMonth={};
+    state.txs.filter(t=>t.type==="expense"&&!t.isAdj).forEach(t=>{const k=t.date.slice(0,7);byMonth[k]=(byMonth[k]||0)+t.amount;});
+    const vals=Object.values(byMonth);
+    return vals.length ? vals.reduce((s,v)=>s+v,0)/vals.length : 0;
+  },[state.txs]);
+  const T3=Math.round(avgMonthlyExp*3),T6=Math.round(avgMonthlyExp*6);
 
   const catBreak=useMemo(()=>{const m={};state.txs.filter(t=>t.type==="expense"&&!t.isAdj&&t.date.startsWith(mo)).forEach(t=>{m[t.category]=(m[t.category]||0)+t.amount;});return Object.entries(m).sort((a,b)=>b[1]-a[1]).slice(0,5);},[state.txs]);
 
@@ -1387,8 +1389,8 @@ function Workspace({userId, userEmail, onLogout}){
     return Object.entries(g).sort((a,b)=>b[0].localeCompare(a[0]));
   },[filtered]);
 
-  function addTx(){setTxErr("");const a=parseFloat(form.amount);if(!form.desc.trim())return setTxErr("Add a description.");if(!a||a<=0)return setTxErr("Enter an amount above zero.");if(form.type==="transfer"&&form.from===form.to)return setTxErr("Pick two different accounts.");dispatch({type:"ADD_TX",p:{...form,amount:a}});setForm({date:today(),desc:"",amount:"",type:"expense",category:"Food & Dining",from:"bislami",to:"mahaana"});setSheet(null);}
-  function addAcc(){setAccErr("");if(!accForm.name.trim())return setAccErr("Give the account a name.");const b=parseFloat(accForm.balance);if(isNaN(b))return setAccErr("Enter the current balance.");const ic={bank:"🏦",wallet:"📱",cash:"💵",investment:"📈",loan:"⚠",other:"•"};dispatch({type:"ADD_ACC",p:{id:"acc_"+Date.now(),name:accForm.name.trim(),balance:b,color:accForm.color,icon:ic[accForm.type]||"•",type:accForm.type}});setAccForm({name:"",balance:"",type:"bank",color:ACCT_COLORS[0]});setSheet(null);}
+  function addTx(){setTxErr("");const a=parseFloat(form.amount);if(!form.desc.trim())return setTxErr("Add a description.");if(!a||a<=0)return setTxErr("Enter an amount above zero.");if(form.type==="transfer"&&form.from===form.to)return setTxErr("Pick two different accounts.");dispatch({type:"ADD_TX",p:{...form,amount:a}});setForm({date:today(),desc:"",amount:"",type:"expense",category:"Food & Dining",from:null,to:null});setSheet(null);}
+  function addAcc(){setAccErr("");if(!accForm.name.trim())return setAccErr("Give the account a name.");const b=parseFloat(accForm.balance);if(isNaN(b))return setAccErr("Enter the current balance.");const ic={bank:"🏦",wallet:"📱",cash:"💵",investment:"📈",loan:"⚠",other:"•"};dispatch({type:"ADD_ACC",p:{id:"acc_"+Date.now(),name:accForm.name.trim(),balance:b,opening:b,color:accForm.color,icon:ic[accForm.type]||"•",type:accForm.type}});setAccForm({name:"",balance:"",type:"bank",color:ACCT_COLORS[0]});setSheet(null);}
   function addCat(){setCatErr("");const c=catInput.trim();if(!c)return setCatErr("Give the category a name.");if(cats.includes(c))return setCatErr("That one already exists.");setCats(p=>[...p,c]);setCatInput("");setSheet(null);}
 
   const si=SI();
@@ -1432,7 +1434,7 @@ function Workspace({userId, userEmail, onLogout}){
           <div style={{padding:"38px 18px 20px",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
             <div>
               <div style={{...disp,fontSize:25,fontWeight:600,letterSpacing:"-0.02em",color:C.ink,lineHeight:1.1}}>Bahi Khata</div>
-              <div style={{fontSize:12,color:C.ink3,marginTop:4}}>Jamil Ahmed · {new Date().toLocaleDateString("en-PK",{month:"long",year:"numeric"})}</div>
+              <div style={{fontSize:12,color:C.ink3,marginTop:4}}>{userEmail} · {new Date().toLocaleDateString("en-PK",{month:"long",year:"numeric"})}</div>
             </div>
             <div style={{display:"flex",gap:8}}>
               <button onClick={toggleTheme} aria-label={mode==="light"?"Switch to dark mode":"Switch to light mode"} style={{background:C.panel,border:`1px solid ${C.rule2}`,color:C.ink2,borderRadius:6,width:37,height:37,cursor:"pointer",fontSize:15,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{mode==="light"?"☾":"☀"}</button>
@@ -1547,13 +1549,13 @@ function Workspace({userId, userEmail, onLogout}){
             })}
 
             {/* Emergency buffer */}
-            {mahaana&&(
+            {bufferAccounts.length>0 && T6>0 && (
               <Panel pad={0}>
-                <div style={{padding:"15px 18px 12px"}}><Eyebrow>Emergency buffer · Mahaana MICF</Eyebrow></div>
+                <div style={{padding:"15px 18px 12px"}}><Eyebrow>Emergency buffer · {bufferAccounts.map(a=>a.name).join(", ")}</Eyebrow></div>
                 <Rule/>
                 <div style={{padding:"14px 18px 8px"}}>
                   {[["Three months",T3,C.brass],["Six months",T6,C.emerald]].map(([lbl,tgt,clr])=>{
-                    const pct=Math.min(100,(mahaana.balance/tgt)*100);
+                    const pct=Math.min(100,(bufferBal/tgt)*100);
                     return(
                       <div key={lbl} style={{marginBottom:15}}>
                         <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:6}}>
@@ -1563,7 +1565,7 @@ function Workspace({userId, userEmail, onLogout}){
                         <div style={{height:6,background:C.panel2,border:`1px solid ${C.rule}`,borderRadius:1}}>
                           <div style={{width:`${pct}%`,height:4,margin:1,background:clr,borderRadius:1,transition:"width .5s"}}/>
                         </div>
-                        <div style={{...mono,color:C.ink4,fontSize:10.5,marginTop:5}}>{fmt(Math.max(0,tgt-mahaana.balance))} still to go</div>
+                        <div style={{...mono,color:C.ink4,fontSize:10.5,marginTop:5}}>{fmt(Math.max(0,tgt-bufferBal))} still to go</div>
                       </div>
                     );
                   })}
@@ -1772,8 +1774,8 @@ function Workspace({userId, userEmail, onLogout}){
               <div style={{flex:1}}><Field label="Date"><input type="date" value={form.date} onChange={e=>setForm(f=>({...f,date:e.target.value}))} style={si}/></Field></div>
               <div style={{flex:1}}><Field label="Category"><select value={form.category} onChange={e=>setForm(f=>({...f,category:e.target.value}))} style={si}>{cats.map(c=><option key={c}>{c}</option>)}</select></Field></div>
             </div>
-            {form.type!=="income"&&<Field label={form.type==="transfer"?"From account":"Paid from"}><select value={form.from} onChange={e=>setForm(f=>({...f,from:e.target.value}))} style={si}>{state.accounts.map(a=><option key={a.id} value={a.id}>{a.name}</option>)}</select></Field>}
-            {(form.type==="income"||form.type==="transfer")&&<Field label={form.type==="transfer"?"To account":"Received into"}><select value={form.to} onChange={e=>setForm(f=>({...f,to:e.target.value}))} style={si}>{state.accounts.filter(a=>form.type!=="transfer"||a.id!==form.from).map(a=><option key={a.id} value={a.id}>{a.name}</option>)}</select></Field>}
+            {form.type!=="income"&&<Field label={form.type==="transfer"?"From account":"Paid from"}><select value={form.from||""} onChange={e=>setForm(f=>({...f,from:e.target.value||null}))} style={si}><option value="">—</option>{state.accounts.map(a=><option key={a.id} value={a.id}>{a.name}</option>)}</select></Field>}
+            {(form.type==="income"||form.type==="transfer")&&<Field label={form.type==="transfer"?"To account":"Received into"}><select value={form.to||""} onChange={e=>setForm(f=>({...f,to:e.target.value||null}))} style={si}><option value="">—</option>{state.accounts.filter(a=>form.type!=="transfer"||a.id!==form.from).map(a=><option key={a.id} value={a.id}>{a.name}</option>)}</select></Field>}
             {txErr&&<div style={{color:C.oxblood,fontSize:12.5,background:C.oxSoft,padding:"10px 13px",borderRadius:6}}>{txErr}</div>}
             <button onClick={addTx} style={{background:C.emerald,color:"#fff",border:"none",borderRadius:7,padding:15,fontWeight:600,fontSize:15,cursor:"pointer",letterSpacing:"0.01em"}}>Record entry</button>
           </div>
