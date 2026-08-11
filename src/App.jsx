@@ -1876,7 +1876,9 @@ function AuthScreen({onAuthed}){
         </Panel>
 
         <div style={{textAlign:"center",color:C.ink4,fontSize:11,marginTop:16,lineHeight:1.6}}>
-          Running without a backend attached — accounts are stored locally to this session for testing.
+          {hasSupabase
+            ? "Connected to Supabase — your account and ledger sync across devices."
+            : "Running without a backend attached — accounts are stored locally to this session for testing."}
         </div>
       </div>
     </div>
