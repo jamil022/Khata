@@ -13,14 +13,16 @@ standalone Vite + React app, ready to run locally, push to GitHub, and deploy.
 - **Frontend: complete.** All screens work — accounts, transactions (add/edit/delete),
   emergency buffer, Insights/analytics with charts, an AI Advisor chat, light/dark
   theme, Google AdSense placement slots (inactive until you add a client ID).
-- **Auth: UI complete, backend is a mock.** Sign-up/login/logout screens exist and
-  work, but accounts and password hashes are currently stored in the browser
-  (localStorage) with a placeholder, non-cryptographic hash — **not real security**.
-  See "Wiring a real backend" below before you let real users sign up.
-- **Storage: works, but is per-browser until a backend is wired.** Every user's
-  ledger data is saved locally (browser localStorage) today. It survives refreshes
-  and closing the tab, but does not sync across devices and is not backed up
-  anywhere until you connect Supabase (or another backend).
+- **Auth: wired to Supabase, with a localStorage mock fallback.** Set
+  `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` (see `.env.example`) and the
+  app uses real Supabase email/password auth. Leave them unset and it falls back
+  to a mock, browser-only auth (non-cryptographic hash) — fine for local
+  exploration, **not real security**, and not synced across devices.
+- **Storage: wired to Supabase, with a localStorage mock fallback.** With the
+  same env vars set, ledger data (accounts, transactions, categories, theme,
+  advisor chat) is read from and written to a Supabase `khata_kv` table, synced
+  across devices and backed up. Without them, data stays in browser localStorage
+  only. See "Supabase setup" below for the table + RLS policy to create.
 - **AI features (Advisor, live savings-rate fetch, insights) call the Anthropic API
   directly from the browser** using the same request shape the Claude.ai artifact
   used. This works today but **exposes no API key in this code** — see "AI features"
@@ -55,74 +57,56 @@ extracted directly from a single-file Claude artifact. It runs correctly as-is.
 Splitting it into multiple files/components is a reasonable next step but not
 required to deploy — see "Suggested next steps" if you want Claude Code to do that.
 
-## Wiring a real backend (Supabase — recommended)
+## Supabase setup
 
-The whole app is already structured for this. Two things need real backends:
-**auth** and **data storage**. Both funnel through small, named integration points.
+Auth (`AUTH_BACKEND` in `src/App.jsx`) and data storage (`ss()`/`sl()`) both
+already point at Supabase — you just need a project and a table.
 
-### 1. Auth
+### 1. Create a project and set env vars
 
-Open `src/App.jsx` and find `AUTH_BACKEND` (search for `AUTH_BACKEND = {`). It has
-exactly three functions: `signUp`, `signIn`, `signOut`, plus `currentSession`.
-Replace their bodies with real Supabase Auth calls:
+Create a project at [supabase.com](https://supabase.com), grab its URL and
+anon key from Settings → API, then:
 
 ```bash
-npm install @supabase/supabase-js
+cp .env.example .env
+# fill in VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY
 ```
 
-```js
-import { createClient } from '@supabase/supabase-js';
-const supabase = createClient(
-  import.meta.env.VITE_SUPABASE_URL,
-  import.meta.env.VITE_SUPABASE_ANON_KEY
+With those unset, the app runs standalone against localStorage and a mock
+auth layer instead — useful for local exploration without a Supabase project.
+
+### 2. Create the `khata_kv` table
+
+Run this in the Supabase SQL editor:
+
+```sql
+create table khata_kv (
+  key text primary key,
+  value jsonb not null,
+  user_id uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  updated_at timestamptz not null default now()
 );
 
-const AUTH_BACKEND = {
-  async signUp(email, password) {
-    const { data, error } = await supabase.auth.signUp({ email, password });
-    if (error) throw new Error(error.message);
-    return { id: data.user.id, email: data.user.email };
-  },
-  async signIn(email, password) {
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) throw new Error(error.message);
-    return { id: data.user.id, email: data.user.email };
-  },
-  async signOut() {
-    await supabase.auth.signOut();
-  },
-  async currentSession() {
-    const { data } = await supabase.auth.getSession();
-    if (!data.session) return null;
-    return { id: data.session.user.id, email: data.session.user.email };
-  },
-};
+alter table khata_kv enable row level security;
+
+create policy "Users manage their own kv rows"
+  on khata_kv for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
 ```
 
-Everything downstream — `Workspace`, `Advisor`, per-user storage namespacing via
-`skFor(userId, ...)` — already expects `userId`/`userEmail` as plain values and
-doesn't care where they came from. No other changes needed for auth to go live.
-
-### 2. Data storage (accounts, transactions, categories, theme, advisor chat)
-
-Right now `ss()`/`sl()` (search for `async function ss(`) read and write
-`localStorage`. Replace their bodies with Supabase table reads/writes, e.g.:
-
-```js
-async function ss(k, v) {
-  await supabase.from('khata_kv').upsert({ key: k, value: v });
-}
-async function sl(k) {
-  const { data } = await supabase.from('khata_kv').select('value').eq('key', k).single();
-  return data?.value ?? null;
-}
-```
-
-A simple `khata_kv (key text primary key, value jsonb)` table with row-level
-security scoped to `auth.uid()` is enough — the app already namespaces every key
-with the user's id via `skFor()`, so a single shared table works fine. A more
+The app namespaces every key with the user's id via `skFor()` already
+(`khata:<userId>:<name>:v4`), so a single shared table works fine — RLS via
+`user_id` is what actually keeps one user's rows invisible to another. A more
 "proper" relational schema (separate `accounts`, `transactions`, `categories`
 tables) is a good follow-up but not required to launch.
+
+### 3. Email confirmation
+
+By default Supabase requires email confirmation before a session is issued —
+`signUp` will throw "check your email to confirm" until the user clicks the
+confirmation link, then `signIn` works normally. Turn this off in
+Authentication → Providers → Email if you want instant sign-up during testing.
 
 ## AI features (Advisor, live savings rate, Insights analysis)
 
@@ -158,8 +142,8 @@ source.
 ## Suggested next steps, roughly in order
 
 1. Push this to GitHub (see below).
-2. Set up a Supabase project — get URL + anon key, wire `AUTH_BACKEND` and `ss`/`sl`
-   as above.
+2. Set up a Supabase project and the `khata_kv` table (see "Supabase setup" above) —
+   auth and storage are already wired, just add your env vars.
 3. Add one serverless function (Vercel/Netlify/Supabase Edge Function all work) to
    proxy Anthropic API calls server-side, and point the three `fetch` calls at it.
 4. Deploy the frontend (Vercel or Netlify both deploy a Vite app with zero config

@@ -1,5 +1,6 @@
 import { useState, useReducer, useMemo, useEffect } from "react";
 import { AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
+import { createClient } from "@supabase/supabase-js";
 
 /* ═══════════════════════════════════════════════════════════════════════════
    BAHI KHATA — a personal ledger
@@ -203,25 +204,41 @@ const today=()=>new Date().toISOString().slice(0,10);
 // userId comes from auth (see AUTH section below) — "guest" is the fallback
 // used before anyone signs in, or while running with no backend attached.
 const skFor = (userId, name) => `khata:${userId || "guest"}:${name}:v4`;
-// Storage adapter — abstracts where data actually lives.
-// Inside the Claude artifact sandbox, window.storage exists and is used.
-// In a real deployment (this file, run via Vite/Claude Code), it falls back
-// to localStorage so the app works standalone. When you wire up a real
-// backend (Supabase/Postgres), replace the bodies of ss()/sl() with API
-// calls — every caller in this file goes through these two functions only.
-const hasArtifactStorage = typeof window !== "undefined" && !!window.storage;
 
+/* ══════════════════════════════════════════════════════════════════════════
+   BACKEND — Supabase when VITE_SUPABASE_URL/VITE_SUPABASE_ANON_KEY are set,
+   otherwise a localStorage-backed mock so the app still runs standalone.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const hasSupabase = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
+
+const supabase = hasSupabase
+  ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+  : null;
+
+// Data storage adapter — every caller in this file goes through ss()/sl().
+// With Supabase configured, reads/writes go to a per-row `khata_kv` table
+// (key text primary key, value jsonb) scoped by RLS to auth.uid(); the app
+// already namespaces every key with the user's id via skFor(), so a single
+// shared table works fine. Without Supabase, falls back to localStorage.
 async function ss(k,v){
   try{
-    if(hasArtifactStorage) await window.storage.set(k, JSON.stringify(v));
-    else localStorage.setItem(k, JSON.stringify(v));
+    if(hasSupabase){
+      const { error } = await supabase.from("khata_kv").upsert({ key: k, value: v });
+      if(error) throw error;
+    } else {
+      localStorage.setItem(k, JSON.stringify(v));
+    }
   }catch(e){}
 }
 async function sl(k){
   try{
-    if(hasArtifactStorage){
-      const r = await window.storage.get(k);
-      return r ? JSON.parse(r.value) : null;
+    if(hasSupabase){
+      const { data, error } = await supabase.from("khata_kv").select("value").eq("key", k).maybeSingle();
+      if(error) throw error;
+      return data?.value ?? null;
     }
     const raw = localStorage.getItem(k);
     return raw ? JSON.parse(raw) : null;
@@ -229,72 +246,82 @@ async function sl(k){
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   AUTH — signup / login / logout, with a single swap point for a real backend.
+   AUTH — signup / login / logout.
 
-   RIGHT NOW (inside this Claude artifact):
-   There is no server here, so this uses a MOCK auth backed by window.storage —
-   accounts and password hashes are stored under a fixed "khata:__auth__" key,
-   shared by whoever has this artifact open. It's good enough to build and test
-   the full signup/login/logout flow, but it is NOT real security: anyone with
-   the artifact's storage can see the hashed table. Treat it as a UI harness.
-
-   WHEN YOU DEPLOY (Supabase / Firebase / your own API):
-   Replace the three functions in AUTH_BACKEND below with real calls:
-     - signUp(email, password)   → create the account server-side
-     - signIn(email, password)   → verify credentials, return { id, email }
-     - signOut()                 → clear the server session
-   Everything else — the forms, the loading states, the per-user storage
-   namespacing via skFor() — stays exactly as it is. The rest of the app reads
-   `auth.user.id` and never needs to know which backend is behind it.
-
-   For Supabase specifically: install their client in your own project (not
-   here), create it with your project URL and anon key, then point signUp to
-   its auth.signUp method, signIn to auth.signInWithPassword, and signOut to
-   auth.signOut. Their docs cover the exact call shapes.
+   With Supabase configured, this uses real Supabase Auth (email/password).
+   Without it, falls back to a MOCK auth backed by localStorage — accounts
+   and password hashes are stored under a fixed "khata:__auth__" key. That
+   mock is NOT real security (non-cryptographic hash, client-side only);
+   it exists purely so the app runs standalone before a backend is wired.
    ══════════════════════════════════════════════════════════════════════════ */
 
 const AUTH_TABLE_KEY = "khata:__auth__accounts";
 const AUTH_SESSION_KEY = "khata:__auth__session";
 
-// Simple non-cryptographic hash — placeholder only. A real backend hashes
-// passwords server-side (bcrypt/argon2); never ship this hash function as-is.
+// Simple non-cryptographic hash — placeholder only, used by the mock auth
+// fallback when no Supabase project is configured.
 function mockHash(str){
   let h = 0;
   for(let i=0;i<str.length;i++){ h = ((h<<5)-h + str.charCodeAt(i)) | 0; }
   return String(h);
 }
 
-const AUTH_BACKEND = {
+const MOCK_AUTH_BACKEND = {
   async signUp(email, password){
     email = email.trim().toLowerCase();
     if(!email || !password) throw new Error("Email and password are required.");
     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("Enter a valid email address.");
     if(password.length < 6) throw new Error("Password must be at least 6 characters.");
-    const table = (await sl(AUTH_TABLE_KEY)) || {};
+    const table = JSON.parse(localStorage.getItem(AUTH_TABLE_KEY) || "{}");
     if(table[email]) throw new Error("An account with this email already exists.");
     const id = "u_" + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
     table[email] = { id, email, passHash: mockHash(password) };
-    await ss(AUTH_TABLE_KEY, table);
+    localStorage.setItem(AUTH_TABLE_KEY, JSON.stringify(table));
     const session = { id, email };
-    await ss(AUTH_SESSION_KEY, session);
+    localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(session));
     return session;
   },
   async signIn(email, password){
     email = email.trim().toLowerCase();
-    const table = (await sl(AUTH_TABLE_KEY)) || {};
+    const table = JSON.parse(localStorage.getItem(AUTH_TABLE_KEY) || "{}");
     const rec = table[email];
     if(!rec || rec.passHash !== mockHash(password)) throw new Error("Incorrect email or password.");
     const session = { id: rec.id, email: rec.email };
-    await ss(AUTH_SESSION_KEY, session);
+    localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(session));
     return session;
   },
   async signOut(){
-    await ss(AUTH_SESSION_KEY, null);
+    localStorage.removeItem(AUTH_SESSION_KEY);
   },
   async currentSession(){
-    return await sl(AUTH_SESSION_KEY);
+    const raw = localStorage.getItem(AUTH_SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
   },
 };
+
+const SUPABASE_AUTH_BACKEND = {
+  async signUp(email, password){
+    const { data, error } = await supabase.auth.signUp({ email: email.trim().toLowerCase(), password });
+    if(error) throw new Error(error.message);
+    if(!data.session) throw new Error("Account created — check your email to confirm before signing in.");
+    return { id: data.user.id, email: data.user.email };
+  },
+  async signIn(email, password){
+    const { data, error } = await supabase.auth.signInWithPassword({ email: email.trim().toLowerCase(), password });
+    if(error) throw new Error(error.message);
+    return { id: data.user.id, email: data.user.email };
+  },
+  async signOut(){
+    await supabase.auth.signOut();
+  },
+  async currentSession(){
+    const { data } = await supabase.auth.getSession();
+    if(!data.session) return null;
+    return { id: data.session.user.id, email: data.session.user.email };
+  },
+};
+
+const AUTH_BACKEND = hasSupabase ? SUPABASE_AUTH_BACKEND : MOCK_AUTH_BACKEND;
 
 /* ── Shared JSON extractor: brace-matching, string-aware ── */
 function extractJSON(text){
