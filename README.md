@@ -110,25 +110,20 @@ Authentication → Providers → Email if you want instant sign-up during testin
 
 ## AI features (Advisor, live savings rate, Insights analysis)
 
-These call `https://api.anthropic.com/v1/messages` directly from the browser using
-`fetch`. **That only worked inside the Claude.ai artifact sandbox**, which injects
-its own authenticated proxy — it will not work as-is once deployed, because there is
-no API key in this code (correctly — never put one in frontend code, it would be
-public).
+These call `api/claude.js`, a Vercel serverless function that proxies to the real
+Anthropic API server-side — the frontend never sees or ships an API key. All you
+need to do is set the key as a server env var:
 
-To make these features work in production, add a small backend endpoint (a single
-serverless function is enough) that:
-1. Receives the prompt from the frontend,
-2. Calls the real Anthropic API server-side using an API key stored as a server
-   secret (get one at console.anthropic.com),
-3. Returns the response to the frontend.
+1. Get an API key at [console.anthropic.com](https://console.anthropic.com).
+2. In your Vercel project → Settings → Environment Variables, add
+   `ANTHROPIC_API_KEY` (no `VITE_` prefix — this one must stay server-only, never
+   exposed to the browser).
+3. Redeploy. The Advisor, live savings-rate lookup, and Insights analysis will
+   start working immediately.
 
-Then update the three `fetch("https://api.anthropic.com/v1/messages", ...)` calls
-in `App.jsx` (search for `callClaude` and `fetchLive`) to call your own endpoint
-instead. Everything else — prompts, JSON parsing, retry logic — stays the same.
-
-This is the single biggest piece of real backend work left. Everything else
-(auth, storage) is a fairly mechanical swap; this needs an actual server function.
+Locally, `npm run dev` (plain Vite) doesn't run `api/` serverless functions — use
+`vercel dev` instead if you want to test these features on your machine, with
+`ANTHROPIC_API_KEY` set in your local `.env`.
 
 ## Google AdSense
 

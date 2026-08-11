@@ -59,6 +59,13 @@ let themeListeners = [];
 function applyTheme(mode){
   const src = mode === "dark" ? DARK : LIGHT;
   Object.keys(src).forEach(k => { C[k] = src[k]; });
+  // Paint <body> itself, not just the centered app column — otherwise any
+  // viewport wider than the column (tablets, desktops) shows a plain white
+  // gutter around the card, which looks broken in dark mode.
+  if (typeof document !== "undefined") {
+    document.body.style.background = src.paper;
+    document.body.style.colorScheme = mode;
+  }
   themeListeners.forEach(fn => fn());
 }
 function useThemeSync(){
@@ -333,12 +340,16 @@ function extractJSON(text){
   return null;
 }
 
+// Calls go through our own serverless proxy (api/claude.js) which holds the
+// Anthropic API key server-side — see README "AI features" for setup.
+const CLAUDE_ENDPOINT = "/api/claude";
+
 /* ── Shared Claude call with retries and real error surfacing ── */
 async function callClaude(body, maxAttempts=3){
   let lastErr = "";
   for(let attempt=1; attempt<=maxAttempts; attempt++){
     try{
-      const res = await fetch("https://api.anthropic.com/v1/messages",{
+      const res = await fetch(CLAUDE_ENDPOINT,{
         method:"POST",
         headers:{"Content-Type":"application/json"},
         body: JSON.stringify(body)
@@ -792,7 +803,7 @@ Reply with this exact JSON shape and nothing else:
     let lastErr = "";
     for(let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++){
       try{
-        const res = await fetch("https://api.anthropic.com/v1/messages",{
+        const res = await fetch(CLAUDE_ENDPOINT,{
           method:"POST",
           headers:{"Content-Type":"application/json"},
           body: JSON.stringify({
@@ -1889,8 +1900,20 @@ function AuthScreen({onAuthed}){
 
 /* ── Root: resolves the session, then shows AuthScreen or Workspace ── */
 export default function App(){
+  useThemeSync();
   const [checking,setChecking]=useState(true);
   const [session,setSession]=useState(null);
+
+  // Before login, there's no per-user theme to load yet, so honor the
+  // system preference — otherwise the loading/auth screens always show
+  // light mode regardless of the OS setting or what the user chose last
+  // time. Workspace applies the user's actual saved preference once
+  // they're signed in, overriding this.
+  useEffect(()=>{
+    if(typeof window!=="undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches){
+      applyTheme("dark");
+    }
+  },[]);
 
   useEffect(()=>{ (async()=>{
     const s = await AUTH_BACKEND.currentSession();
@@ -1905,8 +1928,8 @@ export default function App(){
 
   if(checking){
     return (
-      <div style={{fontFamily:"'IBM Plex Sans',system-ui,sans-serif",background:LIGHT.paper,minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}}>
-        <div style={{color:LIGHT.ink3,fontSize:13}}>Loading…</div>
+      <div style={{fontFamily:"'IBM Plex Sans',system-ui,sans-serif",background:C.paper,minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}}>
+        <div style={{color:C.ink3,fontSize:13}}>Loading…</div>
       </div>
     );
   }
