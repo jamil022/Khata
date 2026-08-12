@@ -46,6 +46,30 @@ New signups get a `subscriptions` row automatically (`plan='free'`,
 `status='trialing'`, 14-day trial — see the `handle_new_user` trigger) so
 they can try the app before you ever touch this table.
 
-The `api/ai.js` proxy checks this table server-side before every AI call —
+The `api/claude.js` proxy checks this table server-side before every AI call —
 free/expired users get a clear "upgrade to continue" error instead of being
 silently blocked or, on the other end, silently given unlimited paid usage.
+
+## Migrating existing users off the old khata_kv blob
+
+If you had real users before this schema existed, their data is sitting in
+the old `khata_kv` JSON-blob table, not the new relational tables — the app
+won't show it until it's copied over. `scripts/migrate-khata-kv.js` does
+that copy (accounts, transactions, custom categories, advisor chat history,
+theme/persona), and is safe to re-run since it skips any user who already
+has rows in the new `accounts` table.
+
+```bash
+SUPABASE_URL=https://xxxx.supabase.co \
+SUPABASE_SERVICE_ROLE_KEY=<service role key, from Settings → API — NOT the anon key> \
+node scripts/migrate-khata-kv.js
+```
+
+It prints a per-user summary of what was migrated. Once you've spot-checked
+the results in the Supabase table editor, you can drop the old table:
+
+```sql
+drop table if exists khata_kv;
+```
+
+If you have no pre-existing users (a fresh launch), skip this entirely.
