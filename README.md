@@ -18,15 +18,21 @@ standalone Vite + React app, ready to run locally, push to GitHub, and deploy.
   app uses real Supabase email/password auth. Leave them unset and it falls back
   to a mock, browser-only auth (non-cryptographic hash) — fine for local
   exploration, **not real security**, and not synced across devices.
-- **Storage: wired to Supabase, with a localStorage mock fallback.** With the
-  same env vars set, ledger data (accounts, transactions, categories, theme,
-  advisor chat) is read from and written to a Supabase `khata_kv` table, synced
-  across devices and backed up. Without them, data stays in browser localStorage
-  only. See "Supabase setup" below for the table + RLS policy to create.
-- **AI features (Advisor, live savings-rate fetch, insights) call the Anthropic API
-  directly from the browser** using the same request shape the Claude.ai artifact
-  used. This works today but **exposes no API key in this code** — see "AI features"
-  below for what you need to do to make these work outside Claude.ai.
+- **Storage: a real relational schema, RLS-enforced, with a localStorage mock
+  fallback.** With Supabase configured, accounts/transactions/categories/advisor
+  chat live in their own Postgres tables (`supabase/migrations/0001_init.sql`),
+  each scoped to `user_id` and protected by Row Level Security — not a single
+  JSON blob. Without Supabase, data stays in browser localStorage only, for
+  standalone local exploration.
+- **AI: dual-provider, server-side proxy.** `api/claude.js` holds provider keys
+  server-side and is called from the frontend — never a browser-exposed key.
+  Users pick Gemini (free tier, default) or Claude (better quality) per-account
+  in Setup. See "AI features" below.
+- **Billing: manual, no Stripe.** New users get a 14-day free trial automatically;
+  after that, AI features gate on `subscriptions.status`/`plan`, which *you* set
+  by hand via SQL after receiving payment out of band. See
+  `supabase/migrations/README.md` for the exact commands. There is no checkout
+  flow and no card is ever collected by this app.
 
 ## Quick start
 
@@ -43,24 +49,27 @@ this creates a local mock account and takes you straight into your ledger.
 ```
 bahi-khata/
 ├── src/
-│   ├── App.jsx        # entire app — components, auth, storage, AI calls
-│   └── main.jsx        # React root
+│   ├── App.jsx          # UI, reducer, auth, AI calls
+│   ├── lib/db.js         # relational data-access layer (Supabase mode)
+│   └── main.jsx          # React root
+├── api/
+│   └── claude.js         # server-side AI proxy — dual provider + billing gate
+├── supabase/
+│   ├── migrations/0001_init.sql   # schema + RLS
+│   └── migrations/README.md       # manual billing commands
 ├── index.html
 ├── package.json
 ├── vite.config.js
-├── .env.example         # copy to .env once you have Supabase/AdSense credentials
+├── .env.example         # copy to .env once you have Supabase/AI credentials
 └── README.md
 ```
 
-Everything currently lives in one file (`App.jsx`, ~1,800 lines) because it was
-extracted directly from a single-file Claude artifact. It runs correctly as-is.
-Splitting it into multiple files/components is a reasonable next step but not
-required to deploy — see "Suggested next steps" if you want Claude Code to do that.
+Most UI still lives in one file (`App.jsx`) because it was extracted from a
+single-file Claude artifact prototype; storage and billing, however, are now
+real (see below). Splitting the UI into multiple component files is a
+reasonable next step but not required to deploy.
 
 ## Supabase setup
-
-Auth (`AUTH_BACKEND` in `src/App.jsx`) and data storage (`ss()`/`sl()`) both
-already point at Supabase — you just need a project and a table.
 
 ### 1. Create a project and set env vars
 
@@ -75,31 +84,23 @@ cp .env.example .env
 With those unset, the app runs standalone against localStorage and a mock
 auth layer instead — useful for local exploration without a Supabase project.
 
-### 2. Create the `khata_kv` table
+### 2. Run the schema migration
 
-Run this in the Supabase SQL editor:
+In the Supabase SQL editor, paste and run `supabase/migrations/0001_init.sql`.
+This creates `profiles`, `subscriptions`, `accounts`, `categories`,
+`transactions`, `savings_goals`, `advisor_messages`, and `ai_usage`, each with
+Row Level Security scoped to `user_id` — that's the real tenant boundary, not
+anything enforced in the frontend. It also seeds a default Pakistan-relevant
+category list and creates a trigger so every new signup gets a `profiles` row
+and a 14-day-trial `subscriptions` row automatically.
 
-```sql
-create table khata_kv (
-  key text primary key,
-  value jsonb not null,
-  user_id uuid not null default auth.uid() references auth.users(id) on delete cascade,
-  updated_at timestamptz not null default now()
-);
+### 3. Manual billing
 
-alter table khata_kv enable row level security;
-
-create policy "Users manage their own kv rows"
-  on khata_kv for all
-  using (auth.uid() = user_id)
-  with check (auth.uid() = user_id);
-```
-
-The app namespaces every key with the user's id via `skFor()` already
-(`khata:<userId>:<name>:v4`), so a single shared table works fine — RLS via
-`user_id` is what actually keeps one user's rows invisible to another. A more
-"proper" relational schema (separate `accounts`, `transactions`, `categories`
-tables) is a good follow-up but not required to launch.
+There's no Stripe integration by design — you handle payment and account
+upgrades yourself. See `supabase/migrations/README.md` for the exact SQL to
+run when a user pays you (bank transfer, cash, whatever) to mark them Pro, or
+to expire access. `api/claude.js` checks this table server-side before every
+AI call, so the gate can't be bypassed from the browser.
 
 ### 3. Email confirmation
 
@@ -110,26 +111,31 @@ Authentication → Providers → Email if you want instant sign-up during testin
 
 ## AI features (Advisor, live savings rate, Insights analysis)
 
-These call `api/claude.js`, a Vercel serverless function that proxies to the
-Google Gemini API server-side — the frontend never sees or ships an API key.
-Gemini has a free tier, so this runs at no cost for normal personal-use
-volumes. All you need to do is set the key as a server env var:
+These call `api/claude.js`, a Vercel serverless function that proxies to
+whichever provider the user picked in Setup — never a key exposed to the
+browser. Two providers are supported, both configured with their own key:
 
-1. Get a free API key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
-   (no credit card required).
-2. In your Vercel project → Settings → Environment Variables, add
-   `GEMINI_API_KEY` (no `VITE_` prefix — this one must stay server-only, never
-   exposed to the browser).
-3. Redeploy. The Advisor, live savings-rate lookup, and Insights analysis will
-   start working immediately.
+1. **Gemini** (default) — free tier, no billing required. Get a key at
+   [aistudio.google.com/apikey](https://aistudio.google.com/apikey) and set
+   `GEMINI_API_KEY` in Vercel → Settings → Environment Variables.
+2. **Claude** (optional, better quality) — paid. Get a key at
+   [console.anthropic.com](https://console.anthropic.com) and set
+   `ANTHROPIC_API_KEY` the same way. Users switch to it from Setup → AI
+   provider; if the key isn't set, that request fails clearly rather than
+   silently falling back.
+
+Set whichever you want to offer (or both), then redeploy — no `VITE_` prefix
+on either, they must stay server-only.
 
 Locally, `npm run dev` (plain Vite) doesn't run `api/` serverless functions — use
 `vercel dev` instead if you want to test these features on your machine, with
-`GEMINI_API_KEY` set in your local `.env`.
+the relevant key(s) in your local `.env`.
 
-Note: the free tier has rate limits (requests per minute/day). If you outgrow
-them, Gemini's paid tier is far cheaper than Claude for this workload, or you
-can point `api/claude.js` back at the Anthropic API.
+Every AI call is gated server-side against the caller's `subscriptions` row
+(free/trialing users get a daily cap, expired accounts are blocked with a
+clear "upgrade" message) and logged to `ai_usage` for rate limiting — both
+enforced using the caller's own Supabase session, under RLS, not a
+client-supplied user id.
 
 ## Google AdSense
 

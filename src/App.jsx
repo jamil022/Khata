@@ -1,6 +1,11 @@
 import { useState, useReducer, useMemo, useEffect } from "react";
 import { AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 import { createClient } from "@supabase/supabase-js";
+import {
+  loadLedger, insertAccount, deleteAccount, insertTransaction, updateTransaction,
+  deleteTransaction, loadCategories, insertCategory,
+  deleteCategory, saveProfile, loadAdvisorMessages, insertAdvisorMessage, clearAdvisorMessages,
+} from "./lib/db.js";
 
 /* ═══════════════════════════════════════════════════════════════════════════
    BAHI KHATA — a personal ledger
@@ -171,7 +176,7 @@ function applyBalMap(accounts,txs){const m=recalc(accounts,txs);return accounts.
 
 function reducer(state,action){
   switch(action.type){
-    case "ADD_TX":{const txs=[{...action.p,id:Date.now()},...state.txs];return{...state,txs,accounts:applyBalMap(state.accounts,txs)};}
+    case "ADD_TX":{const id=action.p.id ?? Date.now();const txs=[{...action.p,id},...state.txs];return{...state,txs,accounts:applyBalMap(state.accounts,txs)};}
     case "EDIT_TX":{const txs=state.txs.map(t=>String(t.id)===String(action.p.id)?action.p:t);return{...state,txs,accounts:applyBalMap(state.accounts,txs)};}
     case "DEL_TX":{const txs=state.txs.filter(t=>String(t.id)!==String(action.id));return{...state,txs,accounts:applyBalMap(state.accounts,txs)};}
     case "ADD_ACC":return{...state,accounts:[...state.accounts,action.p]};
@@ -184,6 +189,8 @@ function reducer(state,action){
     }
     case "LOAD_TXS":{const m=recalc(state.accounts,action.txs);return{...state,txs:action.txs,accounts:state.accounts.map(a=>m[a.id]!==undefined?{...a,balance:m[a.id]}:a)};}
     case "LOAD_ACCS":return{...state,accounts:action.accs};
+    case "SET_TX_DBID":return{...state,txs:state.txs.map(t=>String(t.id)===String(action.id)?{...t,dbId:action.dbId}:t)};
+    case "SET_ACC_DBID":return{...state,accounts:state.accounts.map(a=>a.id===action.id?{...a,dbId:action.dbId}:a)};
     default:return state;
   }
 }
@@ -211,31 +218,15 @@ const supabase = hasSupabase
   ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
   : null;
 
-// Data storage adapter — every caller in this file goes through ss()/sl().
-// With Supabase configured, reads/writes go to a per-row `khata_kv` table
-// (key text primary key, value jsonb) scoped by RLS to auth.uid(); the app
-// already namespaces every key with the user's id via skFor(), so a single
-// shared table works fine. Without Supabase, falls back to localStorage.
+// localStorage-only storage adapter — used purely for the standalone
+// fallback mode (no Supabase configured). When Supabase is configured, real
+// per-row reads/writes go through src/lib/db.js against relational tables
+// instead; every call site below guards on `!hasSupabase` before using these.
 async function ss(k,v){
-  try{
-    if(hasSupabase){
-      const { error } = await supabase.from("khata_kv").upsert({ key: k, value: v });
-      if(error) throw error;
-    } else {
-      localStorage.setItem(k, JSON.stringify(v));
-    }
-  }catch(e){}
+  try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){}
 }
 async function sl(k){
-  try{
-    if(hasSupabase){
-      const { data, error } = await supabase.from("khata_kv").select("value").eq("key", k).maybeSingle();
-      if(error) throw error;
-      return data?.value ?? null;
-    }
-    const raw = localStorage.getItem(k);
-    return raw ? JSON.parse(raw) : null;
-  }catch(e){ return null; }
+  try{ const raw = localStorage.getItem(k); return raw ? JSON.parse(raw) : null; }catch(e){ return null; }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -347,11 +338,21 @@ const CLAUDE_ENDPOINT = "/api/claude";
 /* ── Shared Claude call with retries and real error surfacing ── */
 async function callClaude(body, maxAttempts=3){
   let lastErr = "";
+  // Attach the caller's Supabase access token (not just a client-supplied
+  // userId) so the server can check plan/rate-limit under real RLS instead
+  // of trusting whatever userId the browser sends.
+  let accessToken = null;
+  if(hasSupabase){
+    try{ const { data } = await supabase.auth.getSession(); accessToken = data?.session?.access_token || null; }catch(_){}
+  }
   for(let attempt=1; attempt<=maxAttempts; attempt++){
     try{
       const res = await fetch(CLAUDE_ENDPOINT,{
         method:"POST",
-        headers:{"Content-Type":"application/json"},
+        headers:{
+          "Content-Type":"application/json",
+          ...(accessToken ? {"Authorization":"Bearer "+accessToken} : {}),
+        },
         body: JSON.stringify(body)
       });
       if(!res.ok){
@@ -461,7 +462,7 @@ function TxEditor({tx,accounts,cats,onSave,onCancel}){
 }
 
 /* ── Savings return ── */
-function SavingsWidget({accounts}){
+function SavingsWidget({accounts,aiProvider}){
   useThemeSync();
   const [rates,setRates]=useState({mahaana:10.36,mashreq:10});
   const [rm,setRm]=useState({mahaana:"July 2026"});
@@ -503,6 +504,7 @@ Reply with raw JSON only — no markdown, no code fences, no text before or afte
 
     try{
       const data = await callClaude({
+        provider: aiProvider,
         model:"claude-sonnet-4-6",
         max_tokens: 1600,
         tools:[{type:"web_search_20250305", name:"web_search"}],
@@ -627,7 +629,7 @@ Reply with raw JSON only — no markdown, no code fences, no text before or afte
 }
 
 /* ── Insights ── */
-function Analytics({txs,accounts}){
+function Analytics({txs,accounts,aiProvider}){
   useThemeSync();
   const [ai,setAi]=useState(null);
   const [loading,setLoading]=useState(false);
@@ -798,58 +800,21 @@ Reply with this exact JSON shape and nothing else:
       ? PROMPT.slice(0, SAFE_LIMIT) + "\n\n[Data truncated for length. Base your analysis on what is shown above.]"
       : PROMPT;
 
-    // ── Call with retries ──
-    const MAX_ATTEMPTS = 3;
-    let lastErr = "";
-    for(let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++){
-      try{
-        const res = await fetch(CLAUDE_ENDPOINT,{
-          method:"POST",
-          headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({
-            model:"claude-sonnet-4-6",
-            max_tokens: 2000,
-            messages:[{ role:"user", content: promptToSend }]
-          })
-        });
-
-        if(!res.ok){
-          let detail = "";
-          try { const eb = await res.json(); detail = eb?.error?.message || JSON.stringify(eb).slice(0,200); }
-          catch(_){ try { detail = (await res.text()).slice(0,200); } catch(__){} }
-          lastErr = `HTTP ${res.status}${detail?": "+detail:""}`;
-          if(attempt < MAX_ATTEMPTS){ await new Promise(r=>setTimeout(r, attempt*900)); continue; }
-          throw new Error(lastErr);
-        }
-
-        const data = await res.json();
-        if(data.error){
-          lastErr = data.error.message || "API error";
-          if(attempt < MAX_ATTEMPTS){ await new Promise(r=>setTimeout(r, attempt*900)); continue; }
-          throw new Error(lastErr);
-        }
-
-        const text = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
-
-        const parsed = extractJSON(text);
-        if(!parsed){
-          lastErr = "Could not parse the response";
-          if(attempt < MAX_ATTEMPTS){ await new Promise(r=>setTimeout(r, attempt*900)); continue; }
-          throw new Error(lastErr);
-        }
-
-        setAi(normalise(parsed));
-        setLoading(false);
-        return;
-      }catch(e){
-        lastErr = e.message || "Request failed";
-        if(attempt === MAX_ATTEMPTS){
-          setErr(`Analysis failed after ${MAX_ATTEMPTS} attempts — ${lastErr}. Tap Analyse to retry.`);
-          setLoading(false);
-          return;
-        }
-        await new Promise(r=>setTimeout(r, attempt*900));
-      }
+    try{
+      const data = await callClaude({
+        provider: aiProvider,
+        model:"claude-sonnet-4-6",
+        max_tokens: 2000,
+        messages:[{ role:"user", content: promptToSend }]
+      });
+      const text = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
+      const parsed = extractJSON(text);
+      if(!parsed) throw new Error("Could not parse the response");
+      setAi(normalise(parsed));
+    }catch(e){
+      setErr(`Analysis failed — ${e.message || "unknown error"}. Tap Analyse to retry.`);
+    }finally{
+      setLoading(false);
     }
   }
 
@@ -1131,7 +1096,7 @@ ${recent || "(none yet)"}
 Total entries logged: ${txs.filter(t=>!t.isAdj).length}`;
 }
 
-function Advisor({txs, accounts, userId}){
+function Advisor({txs, accounts, userId, aiProvider, subscription, persona: personaProp, onPersonaChange}){
   useThemeSync();
   const [msgs, setMsgs] = useState([]);
   const [input, setInput] = useState("");
@@ -1142,15 +1107,30 @@ function Advisor({txs, accounts, userId}){
   const [personaDraft, setPersonaDraft] = useState("");
   const [ready, setReady] = useState(false);
 
+  // In Supabase mode the persona lives in Workspace (loaded from `profiles`
+  // alongside the rest of the account) and is handed down as a prop; this
+  // just mirrors it into local state once it arrives.
+  useEffect(()=>{ if(hasSupabase && personaProp) setPersona(personaProp); },[personaProp]);
+
   useEffect(()=>{ (async()=>{
+    if(hasSupabase){
+      try{
+        const m = await loadAdvisorMessages(supabase, userId);
+        if(m.length) setMsgs(m);
+      }catch(_){}
+      setReady(true);
+      return;
+    }
     const m = await sl(skFor(userId, "advisor_msgs"));
     const p = await sl(skFor(userId, "advisor_persona"));
     if(m?.length) setMsgs(m);
     if(p) setPersona(p);
     setReady(true);
   })(); },[userId]);
-  useEffect(()=>{ if(ready) ss(skFor(userId, "advisor_msgs"), msgs); },[msgs, ready, userId]);
-  useEffect(()=>{ if(ready) ss(skFor(userId, "advisor_persona"), persona); },[persona, ready, userId]);
+  // Standalone fallback only — Supabase mode inserts each message as it's
+  // sent (see send() below), and persona saves go through onPersonaChange.
+  useEffect(()=>{ if(ready && !hasSupabase) ss(skFor(userId, "advisor_msgs"), msgs); },[msgs, ready, userId]);
+  useEffect(()=>{ if(ready && !hasSupabase) ss(skFor(userId, "advisor_persona"), persona); },[persona, ready, userId]);
 
   const suggestions = [
     "Where is my money actually going this month?",
@@ -1159,15 +1139,24 @@ function Advisor({txs, accounts, userId}){
     "Compare this month to last month",
   ];
 
+  // Client-side check purely for a clear message before the round trip —
+  // api/claude.js re-checks this server-side under RLS, which is the real
+  // enforcement point since this component's props can't be trusted.
+  const trialActive = subscription?.status==="trialing" && subscription.trial_ends_at && new Date(subscription.trial_ends_at) > new Date();
+  const isPro = subscription?.status==="active" && subscription?.plan!=="free";
+  const advisorLocked = hasSupabase && subscription && !isPro && !trialActive;
+
   async function send(text){
     const q = (text ?? input).trim();
     if(!q || sending) return;
+    if(advisorLocked){ setErr("Your free trial has ended. See Setup for how to upgrade — Advisor access resumes as soon as you're marked Pro."); return; }
     setErr("");
     const userMsg = { role:"user", content:q, id:Date.now() };
     const nextMsgs = [...msgs, userMsg];
     setMsgs(nextMsgs);
     setInput("");
     setSending(true);
+    if(hasSupabase) insertAdvisorMessage(supabase, userId, "user", q).catch(()=>{});
 
     try{
       const context = buildLedgerContext(txs, accounts);
@@ -1186,6 +1175,8 @@ ${context}`;
       });
 
       const data = await callClaude({
+        provider: aiProvider,
+        userId,
         model: "claude-sonnet-4-6",
         max_tokens: 1200,
         messages: history,
@@ -1195,6 +1186,7 @@ ${context}`;
       if(!text2) throw new Error("Empty response");
 
       setMsgs(prev => [...prev, { role:"assistant", content:text2, id:Date.now()+1 }]);
+      if(hasSupabase) insertAdvisorMessage(supabase, userId, "assistant", text2).catch(()=>{});
     }catch(e){
       setErr(e.message || "Something went wrong. Try again.");
     }finally{
@@ -1203,18 +1195,22 @@ ${context}`;
   }
 
   function savePersona(){
-    setPersona(personaDraft.trim() || DEFAULT_PERSONA);
+    const next = personaDraft.trim() || DEFAULT_PERSONA;
+    setPersona(next);
     setShowPersona(false);
+    if(hasSupabase && onPersonaChange) onPersonaChange(next);
   }
 
   function resetPersona(){
     setPersona(DEFAULT_PERSONA);
     setPersonaDraft(DEFAULT_PERSONA);
+    if(hasSupabase && onPersonaChange) onPersonaChange(DEFAULT_PERSONA);
   }
 
   function clearChat(){
     setMsgs([]);
     setErr("");
+    if(hasSupabase) clearAdvisorMessages(supabase, userId).catch(()=>{});
   }
 
   return (
@@ -1297,6 +1293,11 @@ ${context}`;
         )}
       </Panel>
 
+      {advisorLocked && (
+        <div style={{background:C.brSoft, border:`1px solid ${C.brass}`, borderRadius:8, padding:"10px 13px", color:C.brass, fontSize:12.5, marginBottom:10}}>
+          Your free trial has ended. Advisor is a Pro feature — see Setup for how to upgrade.
+        </div>
+      )}
       {/* Composer */}
       <div style={{display:"flex", gap:8}}>
         <input
@@ -1304,13 +1305,14 @@ ${context}`;
           onChange={e=>setInput(e.target.value)}
           onKeyDown={e=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); } }}
           placeholder="Ask your advisor…"
-          style={SI({flex:1})}
+          disabled={advisorLocked}
+          style={SI({flex:1, opacity:advisorLocked?0.6:1})}
         />
-        <button onClick={()=>send()} disabled={sending || !input.trim()} style={{
-          background: (sending||!input.trim()) ? C.panel2 : C.emerald,
-          color: (sending||!input.trim()) ? C.ink4 : "#fff",
+        <button onClick={()=>send()} disabled={sending || !input.trim() || advisorLocked} style={{
+          background: (sending||!input.trim()||advisorLocked) ? C.panel2 : C.emerald,
+          color: (sending||!input.trim()||advisorLocked) ? C.ink4 : "#fff",
           border:"none", borderRadius:8, padding:"0 18px", fontWeight:600, fontSize:13,
-          cursor:(sending||!input.trim())?"default":"pointer"
+          cursor:(sending||!input.trim()||advisorLocked)?"default":"pointer"
         }}>Send</button>
       </div>
     </div>
@@ -1324,6 +1326,7 @@ function Workspace({userId, userEmail, onLogout}){
   const [mode,setMode]=useState("light");
   const [state,dispatch]=useReducer(reducer,{accounts:INIT_ACCS,txs:INIT_TXS});
   const [cats,setCats]=useState(DEFAULT_CATS);
+  const [catRows,setCatRows]=useState([]); // Supabase mode only — DB rows behind the custom names in `cats`
   const [tab,setTab]=useState("home");
   const [filter,setFilter]=useState("all");
   const [period,setPeriod]=useState("all");
@@ -1338,7 +1341,43 @@ function Workspace({userId, userEmail, onLogout}){
   const [catInput,setCatInput]=useState("");
   const [catErr,setCatErr]=useState("");
 
+  const [subscription,setSubscription]=useState(null);
+  const [loadErr,setLoadErr]=useState("");
+  const [aiProvider,setAiProvider]=useState("gemini"); // 'gemini' (free tier) | 'anthropic'
+  function changeAiProvider(p){
+    setAiProvider(p);
+    if(hasSupabase) saveProfile(supabase,userId,{ai_provider:p}).catch(()=>{});
+  }
+  const [persona,setPersona]=useState(null); // null until loaded, then falls back to DEFAULT_PERSONA in Advisor
+  function changePersona(p){
+    setPersona(p);
+    if(hasSupabase) saveProfile(supabase,userId,{advisor_persona:p}).catch(()=>{});
+  }
+
   useEffect(()=>{(async()=>{
+    if(hasSupabase){
+      try{
+        const [{accounts,txs,profile,subscription:sub}, userCats] = await Promise.all([
+          loadLedger(supabase, userId),
+          loadCategories(supabase, userId),
+        ]);
+        if(accounts.length) dispatch({type:"LOAD_ACCS",accs:accounts});
+        if(txs.length) dispatch({type:"LOAD_TXS",txs});
+        const customNames = userCats.filter(c=>!c.is_system).map(c=>c.name);
+        if(customNames.length) setCats(p=>[...p, ...customNames]);
+        setCatRows(userCats);
+        const initialMode = profile?.theme === "dark" ? "dark" : "light";
+        setMode(initialMode); applyTheme(initialMode);
+        if(profile?.ai_provider) setAiProvider(profile.ai_provider);
+        if(profile?.advisor_persona) setPersona(profile.advisor_persona);
+        setSubscription(sub);
+      }catch(e){
+        setLoadErr(e.message || "Couldn't load your ledger. Try refreshing.");
+      }
+      setLoaded(true);
+      return;
+    }
+    // Standalone fallback (no Supabase configured) — localStorage only.
     const t=await sl(skFor(userId,"txs")),a=await sl(skFor(userId,"accs")),c=await sl(skFor(userId,"cats")),m=await sl(skFor(userId,"theme"));
     if(t?.length)dispatch({type:"LOAD_TXS",txs:t});
     if(a?.length)dispatch({type:"LOAD_ACCS",accs:a});
@@ -1353,11 +1392,14 @@ function Workspace({userId, userEmail, onLogout}){
     const next = mode==="light" ? "dark" : "light";
     setMode(next);
     applyTheme(next);
-    ss(skFor(userId,"theme"), next);
+    if(hasSupabase) saveProfile(supabase,userId,{theme:next}).catch(()=>{});
+    else ss(skFor(userId,"theme"), next);
   }
-  useEffect(()=>{if(loaded)ss(skFor(userId,"txs"),state.txs);},[state.txs,loaded,userId]);
-  useEffect(()=>{if(loaded)ss(skFor(userId,"accs"),state.accounts);},[state.accounts,loaded,userId]);
-  useEffect(()=>{if(loaded)ss(skFor(userId,"cats"),cats);},[cats,loaded,userId]);
+  // Standalone fallback only — Supabase mode persists per-row on each
+  // mutation (see addTx/addAcc/etc. below), not via a blanket array sync.
+  useEffect(()=>{if(loaded && !hasSupabase)ss(skFor(userId,"txs"),state.txs);},[state.txs,loaded,userId]);
+  useEffect(()=>{if(loaded && !hasSupabase)ss(skFor(userId,"accs"),state.accounts);},[state.accounts,loaded,userId]);
+  useEffect(()=>{if(loaded && !hasSupabase)ss(skFor(userId,"cats"),cats);},[cats,loaded,userId]);
 
   const assets=state.accounts.filter(a=>a.balance>0).reduce((s,a)=>s+a.balance,0);
   const liabs=Math.abs(state.accounts.filter(a=>a.balance<0).reduce((s,a)=>s+a.balance,0));
@@ -1400,9 +1442,71 @@ function Workspace({userId, userEmail, onLogout}){
     return Object.entries(g).sort((a,b)=>b[0].localeCompare(a[0]));
   },[filtered]);
 
-  function addTx(){setTxErr("");const a=parseFloat(form.amount);if(!form.desc.trim())return setTxErr("Add a description.");if(!a||a<=0)return setTxErr("Enter an amount above zero.");if(form.type==="transfer"&&form.from===form.to)return setTxErr("Pick two different accounts.");dispatch({type:"ADD_TX",p:{...form,amount:a}});setForm({date:today(),desc:"",amount:"",type:"expense",category:"Food & Dining",from:null,to:null});setSheet(null);}
-  function addAcc(){setAccErr("");if(!accForm.name.trim())return setAccErr("Give the account a name.");const b=parseFloat(accForm.balance);if(isNaN(b))return setAccErr("Enter the current balance.");const ic={bank:"🏦",wallet:"📱",cash:"💵",investment:"📈",loan:"⚠",other:"•"};dispatch({type:"ADD_ACC",p:{id:"acc_"+Date.now(),name:accForm.name.trim(),balance:b,opening:b,color:accForm.color,icon:ic[accForm.type]||"•",type:accForm.type}});setAccForm({name:"",balance:"",type:"bank",color:ACCT_COLORS[0]});setSheet(null);}
-  function addCat(){setCatErr("");const c=catInput.trim();if(!c)return setCatErr("Give the category a name.");if(cats.includes(c))return setCatErr("That one already exists.");setCats(p=>[...p,c]);setCatInput("");setSheet(null);}
+  function addTx(){
+    setTxErr("");
+    const a=parseFloat(form.amount);
+    if(!form.desc.trim())return setTxErr("Add a description.");
+    if(!a||a<=0)return setTxErr("Enter an amount above zero.");
+    if(form.type==="transfer"&&form.from===form.to)return setTxErr("Pick two different accounts.");
+    const id=Date.now();
+    const p={...form,amount:a,id};
+    dispatch({type:"ADD_TX",p});
+    setForm({date:today(),desc:"",amount:"",type:"expense",category:"Food & Dining",from:null,to:null});
+    setSheet(null);
+    if(hasSupabase){
+      insertTransaction(supabase,userId,withDbAccountIds(p))
+        .then(row=>dispatch({type:"SET_TX_DBID",id,dbId:row.dbId}))
+        .catch(e=>setLoadErr("Couldn't save that entry: "+(e.message||"unknown error")));
+    }
+  }
+  function addAcc(){
+    setAccErr("");
+    if(!accForm.name.trim())return setAccErr("Give the account a name.");
+    const b=parseFloat(accForm.balance);
+    if(isNaN(b))return setAccErr("Enter the current balance.");
+    const ic={bank:"🏦",wallet:"📱",cash:"💵",investment:"📈",loan:"⚠",other:"•"};
+    const id="acc_"+Date.now();
+    const p={id,name:accForm.name.trim(),balance:b,opening:b,color:accForm.color,icon:ic[accForm.type]||"•",type:accForm.type};
+    dispatch({type:"ADD_ACC",p});
+    setAccForm({name:"",balance:"",type:"bank",color:ACCT_COLORS[0]});
+    setSheet(null);
+    if(hasSupabase){
+      insertAccount(supabase,userId,p)
+        .then(row=>dispatch({type:"SET_ACC_DBID",id,dbId:row.dbId}))
+        .catch(e=>setLoadErr("Couldn't save that account: "+(e.message||"unknown error")));
+    }
+  }
+  function dbIdFor(clientId){ return clientId ? (state.accounts.find(a=>a.id===clientId)?.dbId || null) : null; }
+  function withDbAccountIds(tx){ return {...tx, from: dbIdFor(tx.from), to: dbIdFor(tx.to)}; }
+
+  function setBalance(acc, v){
+    if(isNaN(v))return;
+    const prevBal=acc.balance;
+    dispatch({type:"SET_BAL",id:acc.id,bal:v});
+    if(hasSupabase && Math.abs(v-prevBal)>=0.001){
+      // Mirror the reducer's adjustment transaction server-side — the
+      // account_balances view derives balance from opening_balance + every
+      // transaction, so an inserted adjustment row is all that's needed.
+      const diff=v-prevBal;
+      const adj={date:new Date().toISOString().slice(0,10),desc:`Balance correction — ${acc.name}`,amount:Math.abs(diff),type:diff>0?"income":"expense",category:"Miscellaneous",from:diff<0?acc.id:null,to:diff>0?acc.id:null,isAdj:true};
+      insertTransaction(supabase,userId,withDbAccountIds(adj)).catch(e=>setLoadErr("Couldn't sync balance correction: "+(e.message||"unknown error")));
+    }
+  }
+
+  function addCat(){
+    setCatErr("");
+    const c=catInput.trim();
+    if(!c)return setCatErr("Give the category a name.");
+    if(cats.includes(c))return setCatErr("That one already exists.");
+    setCats(p=>[...p,c]);
+    setCatInput("");
+    setSheet(null);
+    if(hasSupabase){
+      insertCategory(supabase,userId,{name:c,kind:"expense"})
+        .then(row=>setCatRows(p=>[...p,row]))
+        .catch(e=>setCatErr("Saved locally only — "+(e.message||"couldn't sync")));
+    }
+  }
 
   const si=SI();
   const srPct=mInc>0?(mSav/mInc)*100:0;
@@ -1547,8 +1651,8 @@ function Workspace({userId, userEmail, onLogout}){
                           </div>
                           {balId===a.id&&(
                             <div style={{marginTop:11,display:"flex",gap:7}}>
-                              <input type="number" value={balDraft} onChange={e=>setBalDraft(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){const v=parseFloat(balDraft);if(!isNaN(v))dispatch({type:"SET_BAL",id:a.id,bal:v});setBalId(null);}if(e.key==="Escape")setBalId(null);}} autoFocus style={SI({flex:1,padding:"9px 11px",fontSize:13,...mono})}/>
-                              <button onClick={()=>{const v=parseFloat(balDraft);if(!isNaN(v))dispatch({type:"SET_BAL",id:a.id,bal:v});setBalId(null);}} style={{background:C.emerald,color:"#fff",border:"none",borderRadius:6,padding:"9px 15px",fontWeight:600,fontSize:12.5,cursor:"pointer"}}>Set</button>
+                              <input type="number" value={balDraft} onChange={e=>setBalDraft(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){setBalance(a,parseFloat(balDraft));setBalId(null);}if(e.key==="Escape")setBalId(null);}} autoFocus style={SI({flex:1,padding:"9px 11px",fontSize:13,...mono})}/>
+                              <button onClick={()=>{setBalance(a,parseFloat(balDraft));setBalId(null);}} style={{background:C.emerald,color:"#fff",border:"none",borderRadius:6,padding:"9px 15px",fontWeight:600,fontSize:12.5,cursor:"pointer"}}>Set</button>
                             </div>
                           )}
                         </div>
@@ -1584,7 +1688,7 @@ function Workspace({userId, userEmail, onLogout}){
               </Panel>
             )}
 
-            <SavingsWidget accounts={state.accounts}/>
+            <SavingsWidget accounts={state.accounts} aiProvider={aiProvider}/>
 
             <AdSlot slotId="home-bottom" label="Advertisement"/>
           </div>
@@ -1631,7 +1735,14 @@ function Workspace({userId, userEmail, onLogout}){
                         {i>0&&<Rule/>}
                         {editId!==null&&String(editId)===String(tx.id)?(
                           <div style={{padding:10}}>
-                            <TxEditor tx={tx} accounts={state.accounts} cats={cats} onSave={u=>{dispatch({type:"EDIT_TX",p:u});setEditId(null);}} onCancel={()=>setEditId(null)}/>
+                            <TxEditor tx={tx} accounts={state.accounts} cats={cats} onSave={u=>{
+                              dispatch({type:"EDIT_TX",p:u});
+                              setEditId(null);
+                              if(hasSupabase && u.dbId){
+                                updateTransaction(supabase,userId,withDbAccountIds(u))
+                                  .catch(e=>setLoadErr("Couldn't save that edit: "+(e.message||"unknown error")));
+                              }
+                            }} onCancel={()=>setEditId(null)}/>
                           </div>
                         ):(
                           <div style={{padding:"12px 14px",display:"flex",alignItems:"center",gap:11}}>
@@ -1647,7 +1758,10 @@ function Workspace({userId, userEmail, onLogout}){
                               <Figure value={tx.type==="expense"?-tx.amount:tx.amount} size={14} color={tx.type==="transfer"?C.slate:undefined} positive={tx.type==="income"}/>
                               <div style={{display:"flex",gap:9,justifyContent:"flex-end",marginTop:3}}>
                                 <button onClick={()=>setEditId(String(tx.id))} style={{background:"none",border:"none",color:C.emerald,cursor:"pointer",fontSize:10.5,fontWeight:600,padding:0}}>edit</button>
-                                <button onClick={()=>dispatch({type:"DEL_TX",id:tx.id})} style={{background:"none",border:"none",color:C.ink4,cursor:"pointer",fontSize:10.5,padding:0}}>remove</button>
+                                <button onClick={()=>{
+                                  dispatch({type:"DEL_TX",id:tx.id});
+                                  if(hasSupabase && tx.dbId) deleteTransaction(supabase,tx.dbId).catch(e=>setLoadErr("Couldn't delete that entry: "+(e.message||"unknown error")));
+                                }} style={{background:"none",border:"none",color:C.ink4,cursor:"pointer",fontSize:10.5,padding:0}}>remove</button>
                               </div>
                             </div>
                           </div>
@@ -1667,7 +1781,7 @@ function Workspace({userId, userEmail, onLogout}){
         <div style={{padding:"38px 18px 0"}}>
           <div style={{...disp,fontSize:25,fontWeight:600,letterSpacing:"-0.02em",marginBottom:18}}>Reading</div>
           <AdSlot slotId="reading-top" label="Advertisement" style={{marginBottom:14}}/>
-          <Analytics txs={state.txs} accounts={state.accounts}/>
+          <Analytics txs={state.txs} accounts={state.accounts} aiProvider={aiProvider}/>
           <AdSlot slotId="reading-bottom" label="Advertisement" style={{marginTop:14}}/>
         </div>
       )}
@@ -1676,7 +1790,7 @@ function Workspace({userId, userEmail, onLogout}){
       {tab==="advisor"&&(
         <div style={{padding:"38px 18px 0"}}>
           <div style={{...disp,fontSize:25,fontWeight:600,letterSpacing:"-0.02em",marginBottom:18}}>Advisor</div>
-          <Advisor txs={state.txs} accounts={state.accounts} userId={userId}/>
+          <Advisor txs={state.txs} accounts={state.accounts} userId={userId} aiProvider={aiProvider} subscription={subscription} persona={persona} onPersonaChange={changePersona}/>
         </div>
       )}
 
@@ -1693,6 +1807,56 @@ function Workspace({userId, userEmail, onLogout}){
               </div>
             </Panel>
           </div>
+
+          {hasSupabase && (
+            <div>
+              <Eyebrow style={{marginBottom:9,paddingLeft:2}}>Plan</Eyebrow>
+              <Panel pad={0}>
+                <div style={{padding:"13px 16px"}}>
+                  {subscription ? (
+                    <>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <div style={{fontSize:13,fontWeight:600,color:C.ink,textTransform:"capitalize"}}>
+                          {subscription.plan==="free" ? "Free trial" : subscription.plan.replace("_"," ")}
+                        </div>
+                        <Tag tone={subscription.status==="active"||subscription.status==="trialing"?"em":"ox"}>{subscription.status}</Tag>
+                      </div>
+                      {subscription.status==="trialing" && subscription.trial_ends_at && (
+                        <div style={{fontSize:11.5,color:C.ink3,marginTop:6}}>
+                          Trial ends {new Date(subscription.trial_ends_at).toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"})}
+                        </div>
+                      )}
+                      {subscription.status==="active" && subscription.current_period_end && (
+                        <div style={{fontSize:11.5,color:C.ink3,marginTop:6}}>
+                          Renews {new Date(subscription.current_period_end).toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"})}
+                        </div>
+                      )}
+                      <div style={{fontSize:11.5,color:C.ink3,marginTop:10,lineHeight:1.5}}>
+                        Billing is handled manually — no card on file. To upgrade or renew, send payment to the operator directly, then your account is switched to Pro by hand once received.
+                      </div>
+                    </>
+                  ) : <div style={{fontSize:12,color:C.ink3}}>Loading plan…</div>}
+                </div>
+              </Panel>
+            </div>
+          )}
+
+          {hasSupabase && (
+            <div>
+              <Eyebrow style={{marginBottom:9,paddingLeft:2}}>AI provider</Eyebrow>
+              <Panel pad={0}>
+                <div style={{display:"flex"}}>
+                  {[["gemini","Gemini (free)"],["anthropic","Claude (Pro)"]].map(([p,l],i)=>(
+                    <button key={p} onClick={()=>changeAiProvider(p)} style={{flex:1,padding:"13px 0",border:"none",borderLeft:i?`1px solid ${C.rule}`:"none",background:aiProvider===p?C.emerald:C.panel,color:aiProvider===p?"#fff":C.ink3,fontSize:12.5,fontWeight:600,cursor:"pointer",letterSpacing:"0.02em"}}>{l}</button>
+                  ))}
+                </div>
+              </Panel>
+            </div>
+          )}
+
+          {loadErr && (
+            <div style={{background:C.oxSoft, borderRadius:8, padding:"10px 13px", color:C.oxblood, fontSize:12}}>{loadErr}</div>
+          )}
 
           <div>
             <Eyebrow style={{marginBottom:9,paddingLeft:2}}>Appearance</Eyebrow>
@@ -1722,7 +1886,10 @@ function Workspace({userId, userEmail, onLogout}){
                         <div style={{...mono,color:C.ink4,fontSize:10.5,marginTop:1}}>{a.type} · {fmt(a.balance)}</div>
                       </div>
                     </div>
-                    {!CORE_IDS.has(a.id)&&<button onClick={()=>dispatch({type:"DEL_ACC",id:a.id})} style={{background:"none",border:"none",color:C.oxblood,cursor:"pointer",fontSize:11,fontWeight:600,padding:0}}>remove</button>}
+                    {!CORE_IDS.has(a.id)&&<button onClick={()=>{
+                      dispatch({type:"DEL_ACC",id:a.id});
+                      if(hasSupabase && a.dbId) deleteAccount(supabase,a.dbId).catch(e=>setLoadErr("Couldn't delete that account: "+(e.message||"unknown error")));
+                    }} style={{background:"none",border:"none",color:C.oxblood,cursor:"pointer",fontSize:11,fontWeight:600,padding:0}}>remove</button>}
                   </div>
                 </div>
               ))}
@@ -1739,7 +1906,10 @@ function Workspace({userId, userEmail, onLogout}){
                 {cats.map(c=>(
                   <div key={c} style={{background:C.panel2,border:`1px solid ${C.rule}`,borderRadius:5,padding:"5px 10px",fontSize:11.5,display:"flex",alignItems:"center",gap:5,color:C.ink2}}>
                     <span>{CAT_ICONS[c]||"📌"}</span>{c}
-                    {!DEFAULT_CATS.includes(c)&&<button onClick={()=>setCats(p=>p.filter(x=>x!==c))} style={{background:"none",border:"none",color:C.oxblood,cursor:"pointer",fontSize:13,padding:0,lineHeight:1,marginLeft:2}}>×</button>}
+                    {!DEFAULT_CATS.includes(c)&&<button onClick={()=>{
+                      setCats(p=>p.filter(x=>x!==c));
+                      if(hasSupabase) deleteCategory(supabase,userId,c).catch(()=>{});
+                    }} style={{background:"none",border:"none",color:C.oxblood,cursor:"pointer",fontSize:13,padding:0,lineHeight:1,marginLeft:2}}>×</button>}
                   </div>
                 ))}
               </div>
