@@ -110,20 +110,26 @@ Authentication → Providers → Email if you want instant sign-up during testin
 
 ## AI features (Advisor, live savings rate, Insights analysis)
 
-These call `api/claude.js`, a Vercel serverless function that proxies to the real
-Anthropic API server-side — the frontend never sees or ships an API key. All you
-need to do is set the key as a server env var:
+These call `api/claude.js`, a Vercel serverless function that proxies to the
+Google Gemini API server-side — the frontend never sees or ships an API key.
+Gemini has a free tier, so this runs at no cost for normal personal-use
+volumes. All you need to do is set the key as a server env var:
 
-1. Get an API key at [console.anthropic.com](https://console.anthropic.com).
+1. Get a free API key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+   (no credit card required).
 2. In your Vercel project → Settings → Environment Variables, add
-   `ANTHROPIC_API_KEY` (no `VITE_` prefix — this one must stay server-only, never
+   `GEMINI_API_KEY` (no `VITE_` prefix — this one must stay server-only, never
    exposed to the browser).
 3. Redeploy. The Advisor, live savings-rate lookup, and Insights analysis will
    start working immediately.
 
 Locally, `npm run dev` (plain Vite) doesn't run `api/` serverless functions — use
 `vercel dev` instead if you want to test these features on your machine, with
-`ANTHROPIC_API_KEY` set in your local `.env`.
+`GEMINI_API_KEY` set in your local `.env`.
+
+Note: the free tier has rate limits (requests per minute/day). If you outgrow
+them, Gemini's paid tier is far cheaper than Claude for this workload, or you
+can point `api/claude.js` back at the Anthropic API.
 
 ## Google AdSense
 
